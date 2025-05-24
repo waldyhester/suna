@@ -156,70 +156,107 @@ def prepare_params(
             logger.debug(f"Auto-set model_id for Claude 3.7 Sonnet: {params['model_id']}")
 
     # Apply Anthropic prompt caching (minimal implementation)
+    # This section implements a basic prompt caching strategy specifically for Anthropic Claude models.
+    # Prompt caching can help reduce latency and potentially costs for repeated requests with identical, cacheable content.
+    # `cache_control: {"type": "ephemeral"}` is an Anthropic-specific feature.
+    # "ephemeral" means the cache is short-lived, intended for immediate or near-immediate reuse of message content.
+    # It's particularly useful for lengthy system prompts or common conversational turns that might be re-sent quickly.
+
     # Check model name *after* potential modifications (like adding bedrock/ prefix)
-    effective_model_name = params.get("model", model_name) # Use model from params if set, else original
+    effective_model_name = params.get("model", model_name) # Use model from params if set, else original model_name.
+    
+    # Apply caching only if the model is identified as an Anthropic/Claude model.
     if "claude" in effective_model_name.lower() or "anthropic" in effective_model_name.lower():
-        messages = params["messages"] # Direct reference, modification affects params
+        # Get a direct reference to the messages list within params.
+        # Modifications to this 'messages' variable will directly alter the API call parameters.
+        messages = params["messages"] 
 
-        # Ensure messages is a list
+        # Ensure messages is a list, as expected by the subsequent logic.
         if not isinstance(messages, list):
-            return params # Return early if messages format is unexpected
+            logger.warning("Anthropic caching: 'messages' is not a list, skipping caching.")
+            return params # Return early if messages format is unexpected.
 
-        # 1. Process the first message if it's a system prompt with string content
+        # The caching strategy is applied in two main parts:
+        # Part 1: Attempt to cache the system prompt.
+        # Part 2: Attempt to cache parts of the most recent conversational turns.
+
+        # Part 1: Process the first message if it's a system prompt.
+        # System prompts often contain static, lengthy instructions, making them good candidates for caching.
         if messages and messages[0].get("role") == "system":
             content = messages[0].get("content")
             if isinstance(content, str):
-                # Wrap the string content in the required list structure
+                # If the system prompt content is a simple string, it needs to be converted to Anthropic's
+                # structured list format to include `cache_control`.
+                # `cache_control: {"type": "ephemeral"}` is added to the text block.
                 messages[0]["content"] = [
                     {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
                 ]
             elif isinstance(content, list):
-                 # If content is already a list, check if the first text block needs cache_control
+                 # If content is already a list (e.g., for multimodal system prompts or already structured),
+                 # find the first "text" type content block and add `cache_control` if not already present.
+                 # This aims to cache the primary textual part of the system prompt.
                  for item in content:
                      if isinstance(item, dict) and item.get("type") == "text":
                          if "cache_control" not in item:
                              item["cache_control"] = {"type": "ephemeral"}
-                             break # Apply to the first text block only for system prompt
+                         break # Apply to the first text block only and then exit this inner loop.
 
-        # 2. Find and process relevant user and assistant messages
+        # Part 2: Find and process relevant user and assistant messages from the end of the conversation.
+        # The goal is to identify and potentially cache the last few conversational turns,
+        # as these are more likely to be part of repeated or similar interactions.
         last_user_idx = -1
         second_last_user_idx = -1
         last_assistant_idx = -1
 
+        # Iterate backwards from the end of the messages list to find the indices of:
+        # - The most recent user message (`last_user_idx`).
+        # - The user message before that (`second_last_user_idx`).
+        # - The most recent assistant message (`last_assistant_idx`).
+        # These three messages often constitute the last full conversational turn (User -> Assistant -> User),
+        # which is a common pattern to cache.
         for i in range(len(messages) - 1, -1, -1):
             role = messages[i].get("role")
             if role == "user":
                 if last_user_idx == -1:
                     last_user_idx = i
-                elif second_last_user_idx == -1:
+                elif second_last_user_idx == -1: # This will be the one before last_user_idx
                     second_last_user_idx = i
             elif role == "assistant":
-                if last_assistant_idx == -1:
+                if last_assistant_idx == -1: # The most recent assistant message
                     last_assistant_idx = i
 
-            # Stop searching if we've found all needed messages
+            # Optimization: Stop searching if we've found all three targeted messages.
             if last_user_idx != -1 and second_last_user_idx != -1 and last_assistant_idx != -1:
                  break
 
-        # Helper function to apply cache control
-        def apply_cache_control(message_idx: int, message_role: str):
-            if message_idx == -1:
+        # Helper function to apply cache_control to a message at a given index.
+        # This encapsulates the logic for handling string vs. list content formats.
+        def apply_cache_control(message_idx: int, message_role_description: str): # Added description for logging/debugging if needed.
+            if message_idx == -1: # Message not found (e.g., conversation is too short).
                 return
 
             message = messages[message_idx]
             content = message.get("content")
 
             if isinstance(content, str):
+                # If message content is a string, convert it to Anthropic's structured list format
+                # and add `cache_control` to the new text block.
                 message["content"] = [
                     {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
                 ]
             elif isinstance(content, list):
+                # If content is already a list (e.g., multimodal or pre-structured),
+                # iterate through its blocks. Add `cache_control` to any "text" type block
+                # that doesn't already have it. This is to ensure only textual parts are cached.
+                # Note: This currently adds cache_control to *all* text blocks in the message if it's a list.
+                # Depending on requirements, one might only target the first text block.
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
-                        if "cache_control" not in item:
+                        if "cache_control" not in item: # Avoid overwriting existing cache_control.
                            item["cache_control"] = {"type": "ephemeral"}
+            # else: non-string, non-list content is not modified for caching by this logic.
 
-        # Apply cache control to the identified messages
+        # Apply the cache control logic to the identified messages.
         apply_cache_control(last_user_idx, "last user")
         apply_cache_control(second_last_user_idx, "second last user")
         apply_cache_control(last_assistant_idx, "last assistant")

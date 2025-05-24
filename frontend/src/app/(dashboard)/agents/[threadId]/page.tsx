@@ -144,16 +144,30 @@ export default function ThreadPage({
   // Add state for the free tier upgrade dialog
   const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
 
+  // --- React Query Hooks ---
+  // These hooks from TanStack React Query manage server state, including data fetching,
+  // caching, automatic refetching, and mutations for this page.
+
+  /** Fetches basic thread data (like project_id, account_id) for the current `threadId`. */
   const threadQuery = useThreadQuery(threadId);
+  /** Fetches the list of messages for the current `threadId`. */
   const messagesQuery = useMessagesQuery(threadId);
+  /** Dynamically determines the `projectId` from `threadQuery.data` to fetch associated project details. */
   const projectId = threadQuery.data?.project_id || '';
+  /** Fetches project details based on the `projectId`. Enabled only when `projectId` is available. */
   const projectQuery = useProjectQuery(projectId);
+  /** Fetches all agent runs associated with the current `threadId`. */
   const agentRunsQuery = useAgentRunsQuery(threadId);
+  /** Fetches the overall billing status for the current user/account. */
   const billingStatusQuery = useBillingStatusQuery();
+  /** Fetches subscription details for the current user/account. */
   const { data: subscriptionData } = useSubscription();
 
+  /** React Query mutation for adding a user message to the thread. */
   const addUserMessageMutation = useAddUserMessageMutation();
+  /** React Query mutation for starting an agent run. */
   const startAgentMutation = useStartAgentMutation();
+  /** React Query mutation for stopping an agent run. */
   const stopAgentMutation = useStopAgentMutation();
 
   const subscriptionStatus: SubscriptionStatus = subscriptionData?.status === 'active'
@@ -1085,6 +1099,13 @@ export default function ThreadPage({
 
   const handleUpgradeClick = () => {
     router.push('/settings/billing');
+    setShowUpgradeDialog(false);
+    localStorage.setItem('suna_upgrade_dialog_displayed', 'true'); // Mark as shown for this session.
+  };
+
+  /** Handles the click on the "Upgrade Now" button in the dialog, redirecting the user to the billing page. */
+  const handleUpgradeClick = () => {
+    router.push('/settings/billing'); // Navigate to billing settings.
     setShowUpgradeDialog(false);
     localStorage.setItem('suna_upgrade_dialog_displayed', 'true');
   };
