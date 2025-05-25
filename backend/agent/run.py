@@ -69,70 +69,104 @@ async def run_agent(
 
     # Initialize tools with project_id instead of sandbox object
     # This ensures each tool independently verifies it's operating on the correct project
+    # SandboxShellTool: Allows execution of shell commands within the agent's isolated sandbox environment.
     thread_manager.add_tool(SandboxShellTool, project_id=project_id, thread_manager=thread_manager)
+    # SandboxFilesTool: Provides capabilities to read, write, and manage files within the sandbox.
     thread_manager.add_tool(SandboxFilesTool, project_id=project_id, thread_manager=thread_manager)
+    # SandboxBrowserTool: Enables the agent to control a headless browser for web navigation and interaction.
     thread_manager.add_tool(SandboxBrowserTool, project_id=project_id, thread_id=thread_id, thread_manager=thread_manager)
+    # SandboxDeployTool: Handles the deployment of applications or code from the sandbox to a public URL.
     thread_manager.add_tool(SandboxDeployTool, project_id=project_id, thread_manager=thread_manager)
+    # SandboxExposeTool: Allows exposing specific ports from the sandbox to make services accessible externally.
     thread_manager.add_tool(SandboxExposeTool, project_id=project_id, thread_manager=thread_manager)
-    thread_manager.add_tool(MessageTool) # we are just doing this via prompt as there is no need to call it as a tool
+    # MessageTool: Facilitates direct communication with the user, typically for asking questions or signaling task completion.
+    # Note: The comment indicates this is primarily handled via prompt engineering rather than explicit tool calls.
+    thread_manager.add_tool(MessageTool) 
+    # SandboxWebSearchTool: Empowers the agent to perform web searches to gather information.
     thread_manager.add_tool(SandboxWebSearchTool, project_id=project_id, thread_manager=thread_manager)
+    # SandboxVisionTool: Allows the agent to process and understand image content, often used for analyzing screenshots from the browser.
     thread_manager.add_tool(SandboxVisionTool, project_id=project_id, thread_id=thread_id, thread_manager=thread_manager)
-    # Add data providers tool if RapidAPI key is available
+    # Add data providers tool if RapidAPI key is available, enabling access to various external data APIs.
     if config.RAPID_API_KEY:
+        # DataProvidersTool: A generic tool to interact with various third-party data provider APIs (e.g., Zillow, Twitter via RapidAPI).
         thread_manager.add_tool(DataProvidersTool)
 
-
+    # Determine the system message based on the model name.
+    # Different models may have different optimal ways of interpreting system prompts or requiring examples.
     if "gemini-2.5-flash" in model_name.lower():
+        # For Gemini models, a specific prompt structure might be more effective.
+        # The 'get_gemini_system_prompt()' function likely provides this specialized prompt.
+        # The comment "# example included" suggests the Gemini prompt itself might contain or refer to an example.
         system_message = { "role": "system", "content": get_gemini_system_prompt() } # example included
     elif "anthropic" not in model_name.lower():
-        # Only include sample response if the model name does not contain "anthropic"
+        # For models other than Anthropic's Claude (e.g., various OpenAI models), providing a sample response can be crucial.
+        # This sample response guides the model on the expected format of its output, especially for tool usage (e.g., XML structure).
+        # It helps ensure the model's responses are parsable and that tools are called correctly.
         sample_response_path = os.path.join(os.path.dirname(__file__), 'sample_responses/1.txt')
         with open(sample_response_path, 'r') as file:
             sample_response = file.read()
         
         system_message = { "role": "system", "content": get_system_prompt() + "\n\n <sample_assistant_response>" + sample_response + "</sample_assistant_response>" }
     else:
+        # For Anthropic models (Claude), a standard system prompt without an explicit appended sample response is used.
+        # These models might have been trained to follow instructions and use tools effectively without needing an explicit sample in the prompt.
         system_message = { "role": "system", "content": get_system_prompt() }
 
     iteration_count = 0
+    # This flag controls the main execution loop. It's set to False if the agent decides to stop (e.g., via 'complete' or 'ask' tools)
+    # or if an unrecoverable error occurs, or max_iterations is reached.
     continue_execution = True
 
+    # Fetch the latest user message to potentially update the trace input.
+    # This helps in tracking what the user initially requested in this agent run or interaction segment.
     latest_user_message = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'user').order('created_at', desc=True).limit(1).execute()
     if latest_user_message.data and len(latest_user_message.data) > 0:
         data = json.loads(latest_user_message.data[0]['content'])
-        trace.update(input=data['content'])
+        trace.update(input=data['content']) # Update Langfuse trace with the user's input.
 
+    # The main loop for agent execution. It continues as long as `continue_execution` is True
+    # and the number of iterations is less than `max_iterations` to prevent infinite loops.
     while continue_execution and iteration_count < max_iterations:
         iteration_count += 1
         logger.info(f"🔄 Running iteration {iteration_count} of {max_iterations}...")
 
-        # Billing check on each iteration - still needed within the iterations
+        # Perform a billing check at the beginning of each iteration.
+        # This is crucial to ensure that the agent stops if usage limits are exceeded during its operation.
         can_run, message, subscription = await check_billing_status(client, account_id)
         if not can_run:
             error_msg = f"Billing limit reached: {message}"
             trace.event(name="billing_limit_reached", level="ERROR", status_message=(f"{error_msg}"))
-            # Yield a special message to indicate billing limit reached
+            # Yield a special status message to inform the client that the agent stopped due to billing limits.
             yield {
                 "type": "status",
                 "status": "stopped",
                 "message": error_msg
             }
-            break
-        # Check if last message is from assistant using direct Supabase query
+            break # Exit the loop immediately if billing limits are reached.
+
+        # Check if the last message in the thread was from the assistant.
+        # If so, it implies the agent has completed its turn and is waiting for user input or further instructions.
+        # This prevents the agent from re-running automatically without new stimuli.
         latest_message = await client.table('messages').select('*').eq('thread_id', thread_id).in_('type', ['assistant', 'tool', 'user']).order('created_at', desc=True).limit(1).execute()
         if latest_message.data and len(latest_message.data) > 0:
             message_type = latest_message.data[0].get('type')
             if message_type == 'assistant':
-                logger.info(f"Last message was from assistant, stopping execution")
-                trace.event(name="last_message_from_assistant", level="INFO", status_message=(f"Last message was from assistant, stopping execution"))
-                continue_execution = False
-                break
+                logger.info(f"Last message was from assistant, stopping execution for this iteration.")
+                trace.event(name="last_message_from_assistant", level="INFO", status_message=(f"Last message was from assistant, stopping execution for this iteration."))
+                continue_execution = False # Signal to stop the loop.
+                break # Exit the loop.
 
         # ---- Temporary Message Handling (Browser State & Image Context) ----
+        # This section constructs a temporary message to provide the LLM with the most recent
+        # contextual information, such as the current browser state (DOM, screenshot) or
+        # an image the user explicitly requested to see. This message is injected into the
+        # current LLM call to ensure the agent's decisions are based on the latest available data.
+        # The goal is to make the LLM "aware" of the most recent visual/state information before it generates its response.
         temporary_message = None
-        temp_message_content_list = [] # List to hold text/image blocks
+        temp_message_content_list = [] # List to hold different parts of the temporary message (text, image_url).
 
-        # Get the latest browser_state message
+        # Fetch the latest 'browser_state' message. This message typically contains
+        # a snapshot of the browser's DOM, metadata, and a screenshot.
         latest_browser_state_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'browser_state').order('created_at', desc=True).limit(1).execute()
         if latest_browser_state_msg.data and len(latest_browser_state_msg.data) > 0:
             try:
@@ -244,43 +278,47 @@ async def run_agent(
                 generation=generation
             )
 
+            # Handle direct error responses from run_thread (e.g., if the underlying LLM call fails validation)
             if isinstance(response, dict) and "status" in response and response["status"] == "error":
                 logger.error(f"Error response from run_thread: {response.get('message', 'Unknown error')}")
                 trace.event(name="error_response_from_run_thread", level="ERROR", status_message=(f"{response.get('message', 'Unknown error')}"))
-                yield response
-                break
+                yield response # Forward the error response to the client.
+                break # Stop execution if run_thread itself returns an error.
 
-            # Track if we see ask, complete, or web-browser-takeover tool calls
+            # This variable will track if the agent used a "terminal" XML tool like <ask>, <complete>, or <web-browser-takeover>.
+            # These tools typically signify the end of the agent's current action sequence.
             last_tool_call = None
 
-            # Process the response
-            error_detected = False
+            # Process the streaming response from the LLM.
+            error_detected = False # Flag to track if an error status is encountered in the stream.
             try:
-                full_response = ""
+                full_response = "" # Accumulate the full text response from the assistant.
                 async for chunk in response:
-                    # If we receive an error chunk, we should stop after this iteration
+                    # If an error status chunk is received, it indicates a problem during tool execution or response generation.
                     if isinstance(chunk, dict) and chunk.get('type') == 'status' and chunk.get('status') == 'error':
                         logger.error(f"Error chunk detected: {chunk.get('message', 'Unknown error')}")
                         trace.event(name="error_chunk_detected", level="ERROR", status_message=(f"{chunk.get('message', 'Unknown error')}"))
-                        error_detected = True
-                        yield chunk  # Forward the error chunk
-                        continue     # Continue processing other chunks but don't break yet
+                        error_detected = True # Mark that an error was detected.
+                        yield chunk  # Forward the error chunk to the client.
+                        continue     # Continue processing other chunks in this response, but the loop will break afterwards.
                         
-                    # Check for XML versions like <ask>, <complete>, or <web-browser-takeover> in assistant content chunks
+                    # Check for specific XML tool tags within the assistant's content.
+                    # These tags (<ask>, <complete>, <web-browser-takeover>) signal that the agent
+                    # has decided to pause, finish, or hand over control.
                     if chunk.get('type') == 'assistant' and 'content' in chunk:
                         try:
-                            # The content field might be a JSON string or object
+                            # The content from the LLM might be a JSON string or already an object.
                             content = chunk.get('content', '{}')
                             if isinstance(content, str):
                                 assistant_content_json = json.loads(content)
                             else:
                                 assistant_content_json = content
 
-                            # The actual text content is nested within
+                            # The actual text from the assistant is nested.
                             assistant_text = assistant_content_json.get('content', '')
-                            full_response += assistant_text
-                            if isinstance(assistant_text, str): # Ensure it's a string
-                                 # Check for the closing tags as they signal the end of the tool usage
+                            full_response += assistant_text # Accumulate the textual response.
+                            if isinstance(assistant_text, str): # Ensure it's a string for searching.
+                                 # Detect the presence of closing tags for terminal tools.
                                 if '</ask>' in assistant_text or '</complete>' in assistant_text or '</web-browser-takeover>' in assistant_text:
                                    if '</ask>' in assistant_text:
                                        xml_tool = 'ask'
@@ -289,34 +327,35 @@ async def run_agent(
                                    elif '</web-browser-takeover>' in assistant_text:
                                        xml_tool = 'web-browser-takeover'
 
-                                   last_tool_call = xml_tool
+                                   last_tool_call = xml_tool # Record the terminal tool used.
                                    logger.info(f"Agent used XML tool: {xml_tool}")
                                    trace.event(name="agent_used_xml_tool", level="INFO", status_message=(f"Agent used XML tool: {xml_tool}"))
                         except json.JSONDecodeError:
-                            # Handle cases where content might not be valid JSON
+                            # Handle cases where assistant content might not be valid JSON.
                             logger.warning(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}")
                             trace.event(name="warning_could_not_parse_assistant_content_json", level="WARNING", status_message=(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}"))
                         except Exception as e:
                             logger.error(f"Error processing assistant chunk: {e}")
                             trace.event(name="error_processing_assistant_chunk", level="ERROR", status_message=(f"Error processing assistant chunk: {e}"))
 
-                    yield chunk
+                    yield chunk # Forward the current chunk to the client.
 
-                # Check if we should stop based on the last tool call or error
+                # After processing all chunks, check if an error was detected during streaming.
                 if error_detected:
-                    logger.info(f"Stopping due to error detected in response")
-                    trace.event(name="stopping_due_to_error_detected_in_response", level="INFO", status_message=(f"Stopping due to error detected in response"))
-                    generation.end(output=full_response, status_message="error_detected", level="ERROR")
-                    break
+                    logger.info(f"Stopping due to error detected in response stream.")
+                    trace.event(name="stopping_due_to_error_detected_in_response_stream", level="INFO", status_message=(f"Stopping due to error detected in response stream."))
+                    generation.end(output=full_response, status_message="error_detected_in_stream", level="ERROR")
+                    break # Exit the main loop due to the error.
                     
+                # If a terminal XML tool was used, the agent's current task is considered complete for this iteration.
                 if last_tool_call in ['ask', 'complete', 'web-browser-takeover']:
                     logger.info(f"Agent decided to stop with tool: {last_tool_call}")
                     trace.event(name="agent_decided_to_stop_with_tool", level="INFO", status_message=(f"Agent decided to stop with tool: {last_tool_call}"))
-                    generation.end(output=full_response, status_message="agent_stopped")
-                    continue_execution = False
+                    generation.end(output=full_response, status_message=f"agent_stopped_with_{last_tool_call}")
+                    continue_execution = False # Signal to stop the main execution loop.
 
             except Exception as e:
-                # Just log the error and re-raise to stop all iterations
+                # Catch any unexpected errors during the response streaming process.
                 error_msg = f"Error during response streaming: {str(e)}"
                 logger.error(f"Error: {error_msg}")
                 trace.event(name="error_during_response_streaming", level="ERROR", status_message=(f"Error during response streaming: {str(e)}"))
