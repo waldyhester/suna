@@ -18,7 +18,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.11"
-python-dotenv = "1.0.1"
+python-dotenv = "1.2.2"
 litellm = "1.66.1"
 click = "8.1.7"
 questionary = "2.0.1"
